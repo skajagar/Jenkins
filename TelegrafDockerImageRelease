@@ -1,0 +1,375 @@
+def credentials = [
+    [$class: 'UsernamePasswordMultiBinding', credentialsId: 'skajagar-docker', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS'],
+    [$class: 'StringBinding', credentialsId: 'sk-jenkin-ssh-pub-text', variable: 'GH_ACCESS_TOKEN' ]
+]
+
+
+// def FARGATE_REPO='git@github.com:wavefrontHQ/wavefront-fargate-collector.git' 
+def TELEGRAF_REPO='https://github.com/skajagar/wavefront-kubernetes.git' // I AM PUSHING GIT RELEASE TAGS TO MY FORKED REPO NOW
+def JOB_USER=''
+def JOB_USER_ID=''
+def RC_NUMBER=''
+def DOCKER_IMAGE_VERSION=''
+def PREFIX=''
+def GITHUB_REPO=''
+def FULL_GIT_REPO_NAME=''
+def REL_BRANCH=''
+
+pipeline {
+    agent any
+    options {
+        timestamps()
+        timeout(time: 10, unit: "MINUTES")
+        withCredentials(credentials)
+    }
+    parameters {
+        choice(
+            name: "RELEASE_TYPE", 
+            choices: ["", "release", "rc", "manual"],
+            description: "Do major, rc or manual release."
+        )
+        string(
+            defaultValue: 'origin/master',
+            name: 'BRANCH', 
+            description: 'Branch to build.'
+        )
+        string(
+            defaultValue: '',
+            name: 'DOCKER_TAG_NAME', 
+            description: 'Specify this field only for "manual" release type. Its value will be used for tagging docker image.'
+        )
+        choice(
+            name: "TELEGRAF_IMAGE_KIND",
+            choices: ["", "TELEGRAF IMAGE", "TELEGRAF SIDECAR IMAGE", "ALL"],
+            description: "Docker image build telegraf, telegraf-sidecar"
+        )
+    }
+    stages {
+        stage("Initialization") {
+            steps {
+                 cleanWs()
+                    echo "THIS IS BUILD BRANCH: ${params.BRANCH}"
+                    echo "THIS IS DOCKER_TAG_NAME: ${params.BRANCH}"
+                    echo "THIS IS BUILD RELEASE_TYPE: ${params.BRANCH}"
+            }
+        }
+
+        stage("Checkout wavefront-kubernetes repo (wavefrontHQ)") {
+            options {
+                timeout(time: 5, unit: "MINUTES")
+                }
+            steps {
+                dir ('wavefront-kubernetes') {
+                checkout([$class: 'GitSCM', 
+                branches: [[name: '${BRANCH}']], 
+                doGenerateSubmoduleConfigurations: false, 
+                extensions: [], 
+                submoduleCfg: [], 
+                userRemoteConfigs: [[url: "${TELEGRAF_REPO}"]]])
+                }
+                
+            }
+
+        }
+
+        stage("Build Docker Image for Wavefront Telegraf - telegraf only") {
+            when {
+                expression {
+                params.TELEGRAF_IMAGE_KIND == 'TELEGRAF IMAGE'
+                }
+            }
+            options {
+                timeout(time: 10, unit: "MINUTES")
+            }
+            steps {
+                script {
+                    echo "Building Docker Image for Wavefronrt Telegraf "
+                    sh """
+                    cd ${WORKSPACE}/wavefront-kubernetes/docker-images/telegraf/
+                    docker build -t skajagar/telegraf:${DOCKER_TAG_NAME} .
+                    """
+                }
+            }
+        }
+
+        stage("Build Docker Image for Wavefront Telegraf - telegraf-sidecar only") {
+            when {
+                expression {
+                    params.TELEGRAF_IMAGE_KIND == 'TELEGRAF SIDECAR IMAGE'
+                }
+            }
+            options {
+                timeout(time: 10, unit: "MINUTES")
+            }
+            steps {
+                script {
+                    echo "Building Docker Image for Wavefronrt Telegraf "
+                    sh """
+                    cd ${WORKSPACE}/wavefront-kubernetes/docker-images/telegraf-sidecar/
+                    docker build -t skajagar/telegrafsidecar:${DOCKER_TAG_NAME} .
+                    """
+                }
+            }
+        }
+
+        stage("Build Docker Image for Wavefront Telegraf - both telegraf and telegraf-sidecar"){
+            when {
+                expression {
+                    params.TELEGRAF_IMAGE_KIND == "ALL"
+                    }
+                }    
+            options {
+                timeout(time: 10, unit: "MINUTES")
+                }
+            steps {
+                script {
+                    echo "Building Docker Image for Wavefronrt Telegraf "
+                    sh """
+                    cd ${WORKSPACE}/wavefront-kubernetes/docker-images/telegraf/
+                    docker build -t skajagar/telegraf:${DOCKER_TAG_NAME} .
+                    cd ${WORKSPACE}/wavefront-kubernetes/docker-images/telegraf-sidecar/
+                    docker build -t skajagar/telegrafsidecar:${DOCKER_TAG_NAME} .
+                    """
+                }
+            }
+        }
+
+        stage("Check type of releasse") {
+            options {
+                timeout(time: 10, unit: "MINUTES")
+                }
+            parallel {
+
+
+                stage("RELEASE_TYPE: release") {
+                                when {
+                                    expression {
+                                        params.RELEASE_TYPE == 'release'
+                                    }
+                                }
+                                steps {
+                                    script {
+                                        echo "The release type for this build is: ${params.RELEASE_TYPE}"
+                                        echo "This step will create github release and tag"
+                                        echo "And then push the image with version tag"
+
+                                        REL_BRANCH = sh(script: "echo ${params.BRANCH} | sed 's|origin/||'", returnStdout: true).trim()
+                                        echo "REL BRANCH: ${REL_BRANCH}"
+                                        DOCKER_IMAGE_VERSION = params.DOCKER_TAG_NAME
+                                        echo "DOCKER IMAGE VERSION: ${DOCKER_IMAGE_VERSION}"
+                                        echo "DOCKER TELEGRAF IMAGE KIND: ${params.TELEGRAF_IMAGE_KIND}"
+
+                                        // GH_JSON_OBJECT = sh(script: "echo '{\"tag_name\": \"v${DOCKER_IMAGE_VERSION}\", \"target_commitish\": \"${REL_BRANCH}\", \"name\": \"Release v${DOCKER_IMAGE_VERSION}\", \"body\": \"Description for v${DOCKER_IMAGE_VERSION}\", \"draft\": false, \"prerelease\": false}'", returnStdout: true).trim()
+                                        // sh(script: "curl -X POST -H 'Content-Type:application/json' -H 'Authorization: token ${GH_ACCESS_TOKEN}' --data '${GH_JSON_OBJECT}' https://api.github.com/repos/skajagar/wavefront-kubernetes/releases")
+
+                                        PUSH_TO_DOCKER='''#!/bin/bash -xe
+                                        DOCKER_USER=$1
+                                        DOCKER_PASS=$2
+                                        DOCKER_IMAGE_VERSION=$3
+                                        TELEGRAF_IMAGE_KIND=$4
+
+                                        docker login --username=$DOCKER_USER --password=$DOCKER_PASS
+                                        docker images
+                                        docker ps
+
+                                        
+                                        if [[ $TELEGRAF_IMAGE_KIND == 'TELEGRAF IMAGE' ]]; then
+                                        docker push skajagar/telegraf:${DOCKER_TAG_NAME}
+                                        elif [[ $TELEGRAF_IMAGE_KIND == 'TELEGRAF SIDECAR IMAGE' ]]; then
+                                        docker push skajagar/telegrafsidecar:${DOCKER_TAG_NAME}
+                                        elif [[ $TELEGRAF_IMAGE_KIND == 'ALL' ]]; then
+                                        docker push skajagar/telegraf:${DOCKER_TAG_NAME}
+                                        docker push skajagar/telegrafsidecar:${DOCKER_TAG_NAME}
+                                        else
+                                        printf '%s\n' "DOCKER IMAGE KIND IS INVALID" >&2
+                                        exit 1
+                                        fi
+                                        
+                                        '''
+
+                                        writeFile(text:PUSH_TO_DOCKER, file:"PUSH_TO_DOCKER_RELEASE.sh")
+                                        sh "bash PUSH_TO_DOCKER_RELEASE.sh ${DOCKER_USER} ${DOCKER_PASS} ${DOCKER_IMAGE_VERSION} \"${TELEGRAF_IMAGE_KIND}\""
+                                    }
+                                }
+                }
+
+
+                stage("RELEASE_TYPE: rc") {
+                                when {
+                                       expression {
+                                            params.RELEASE_TYPE == 'rc'
+                                        }
+                                    }
+                                steps {
+                                    script {
+                                         echo "The release type for this build is: ${params.RELEASE_TYPE}"
+                                         echo "And then push new image tagged with DOCKER_TAG_NAME parameter"
+
+                                         DOCKER_IMAGE_VERSION = params.DOCKER_TAG_NAME
+                                         echo "DOCKER IMAGE VERSION: ${DOCKER_IMAGE_VERSION}"
+
+
+                                         def GET_TELEGRAF_RC_NUMBER='''#!/bin/bash
+                                         PAGE=1
+                                         RC_NUMBER=0
+                                         DOCKER_IMAGE_VERSION=$1
+                                         while true; do
+                                            QUERY=`curl -L -s "https://registry.hub.docker.com/v2/repositories/skajagar/telegraf/tags/?page=${PAGE}"`
+                                            CURRENT_RC_NUMBER=`echo $QUERY | jq . | grep name | grep $DOCKER_IMAGE_VERSION-rc | awk 'BEGIN {FS="-rc"} ; { print $2 }' | cut -d '"' -f 1 | sort -rn | head -n 1`
+                                            if [[ $RC_NUMBER -le $CURRENT_RC_NUMBER ]]; then
+                                                RC_NUMBER=$CURRENT_RC_NUMBER
+                                            fi
+                                            if [[ `echo $QUERY | jq .next` = "null" ]]; then
+                                                break
+                                            fi
+                                            PAGE=$((PAGE+1))
+                                        done
+                                        RC_NUMBER=$((RC_NUMBER+1))
+                                        echo "$RC_NUMBER"
+                                        '''
+                                        writeFile(text:GET_TELEGRAF_RC_NUMBER, file:"GET_TELEGRAF_RC_NUMBER.sh")
+                                        RC_NUMBER_TELEGRAF = sh(script: "bash GET_TELEGRAF_RC_NUMBER.sh ${DOCKER_IMAGE_VERSION}", returnStdout: true).trim()
+
+                                        def GET_TELEGRAF_SIDECAR_RC_NUMBER='''#!/bin/bash
+                                         PAGE=1
+                                         RC_NUMBER=0
+                                         DOCKER_IMAGE_VERSION=$1
+                                         while true; do
+                                            QUERY=`curl -L -s "https://registry.hub.docker.com/v2/repositories/skajagar/telegrafsidecar/tags/?page=${PAGE}"`
+                                            CURRENT_RC_NUMBER=`echo $QUERY | jq . | grep name | grep $DOCKER_IMAGE_VERSION-rc | awk 'BEGIN {FS="-rc"} ; { print $2 }' | cut -d '"' -f 1 | sort -rn | head -n 1`
+                                            if [[ $RC_NUMBER -le $CURRENT_RC_NUMBER ]]; then
+                                                RC_NUMBER=$CURRENT_RC_NUMBER
+                                            fi
+                                            if [[ `echo $QUERY | jq .next` = "null" ]]; then
+                                                break
+                                            fi
+                                            PAGE=$((PAGE+1))
+                                        done
+                                        RC_NUMBER=$((RC_NUMBER+1))
+                                        echo "$RC_NUMBER"
+                                        '''
+                                        writeFile(text:GET_TELEGRAF_SIDECAR_RC_NUMBER, file:"GET_TELEGRAF_SIDECAR_RC_NUMBER.sh")
+                                        RC_NUMBER_TELEGRAF_SIDECAR = sh(script: "bash GET_TELEGRAF_SIDECAR_RC_NUMBER.sh ${DOCKER_IMAGE_VERSION}", returnStdout: true).trim()
+
+                                       
+
+
+                                        PUSH_TO_DOCKER='''#!/bin/bash
+                                        DOCKER_USER=$1
+                                        DOCKER_PASS=$2
+                                        DOCKER_IMAGE_VERSION=$3
+                                        RC_NUMBER_TELEGRAF=$4
+                                        RC_NUMBER_TELEGRAF_SIDECAR=$5
+
+                                        docker login --username=$DOCKER_USER --password=$DOCKER_PASS
+                                        docker images
+                                        docker ps
+
+                                        
+                                        if [[ $TELEGRAF_IMAGE_KIND == 'TELEGRAF IMAGE' ]]; then
+                                        docker tag skajagar/telegraf:${DOCKER_TAG_NAME} skajagar/telegraf:${DOCKER_TAG_NAME}-rc${RC_NUMBER_TELEGRAF}
+                                        docker push skajagar/telegraf:${DOCKER_TAG_NAME}-rc${RC_NUMBER_TELEGRAF}
+                                        elif [[ $TELEGRAF_IMAGE_KIND == 'TELEGRAF SIDECAR IMAGE' ]]; then
+                                        docker tag skajagar/telegrafsidecar:${DOCKER_TAG_NAME} skajagar/telegrafsidecar:${DOCKER_TAG_NAME}-rc${RC_NUMBER_TELEGRAF_SIDECAR}
+                                        docker push skajagar/telegrafsidecar:${DOCKER_TAG_NAME}-rc${RC_NUMBER_TELEGRAF_SIDECAR}
+                                        elif [[ $TELEGRAF_IMAGE_KIND == 'ALL' ]]; then
+                                        docker tag skajagar/telegraf:${DOCKER_TAG_NAME} skajagar/telegraf:${DOCKER_TAG_NAME}-rc${RC_NUMBER_TELEGRAF}
+                                        docker push skajagar/telegraf:${DOCKER_TAG_NAME}-rc${RC_NUMBER_TELEGRAF}
+                                        docker tag skajagar/telegrafsidecar:${DOCKER_TAG_NAME} skajagar/telegrafsidecar:${DOCKER_TAG_NAME}-rc${RC_NUMBER_TELEGRAF_SIDECAR}
+                                        docker push skajagar/telegrafsidecar:${DOCKER_TAG_NAME}-rc${RC_NUMBER_TELEGRAF_SIDECAR}
+                                        else
+                                        printf '%s\n' "DOCKER IMAGE KIND IS INVALID" >&2
+                                        exit 1
+                                        fi
+                                        
+                                        '''
+
+                                        writeFile(text:PUSH_TO_DOCKER, file:"PUSH_TO_DOCKER_RC.sh")
+                                        sh "bash PUSH_TO_DOCKER_RC.sh ${DOCKER_USER} ${DOCKER_PASS} ${DOCKER_IMAGE_VERSION} ${RC_NUMBER_TELEGRAF} ${RC_NUMBER_TELEGRAF_SIDECAR} \"${TELEGRAF_IMAGE_KIND}\""
+
+
+                                    }
+                                }
+                }
+
+                stage("RELEASE_TYPE: manual") {
+                                when {
+                                        expression {
+                                            params.RELEASE_TYPE == 'manual'
+                                        }
+                                    }
+                                steps {
+                                    echo "The release type for this build is: ${params.RELEASE_TYPE}"
+
+                                    script {
+
+
+                                        REL_BRANCH = sh(script: "echo ${params.BRANCH} | sed 's|origin/||'", returnStdout: true).trim()
+                                        echo "REL BRANCH: ${REL_BRANCH}"
+                                        DOCKER_IMAGE_VERSION = params.DOCKER_TAG_NAME
+                                        echo "DOCKER IMAGE VERSION: ${DOCKER_IMAGE_VERSION}"
+                                        echo "DOCKER TELEGRAF IMAGE KIND: ${params.TELEGRAF_IMAGE_KIND}"
+
+                                        // GH_JSON_OBJECT = sh(script: "echo '{\"tag_name\": \"v${DOCKER_IMAGE_VERSION}\", \"target_commitish\": \"${REL_BRANCH}\", \"name\": \"Release v${DOCKER_IMAGE_VERSION}\", \"body\": \"Description for v${DOCKER_IMAGE_VERSION}\", \"draft\": false, \"prerelease\": false}'", returnStdout: true).trim()
+                                        // sh(script: "curl -X POST -H 'Content-Type:application/json' -H 'Authorization: token ${GH_ACCESS_TOKEN}' --data '${GH_JSON_OBJECT}' https://api.github.com/repos/skajagar/wavefront-kubernetes/releases")
+
+                                        PUSH_TO_DOCKER='''#!/bin/bash -xe
+                                        DOCKER_USER=$1
+                                        DOCKER_PASS=$2
+                                        DOCKER_IMAGE_VERSION=$3
+                                        TELEGRAF_IMAGE_KIND=$4
+
+                                        docker login --username=$DOCKER_USER --password=$DOCKER_PASS
+                                        docker images
+                                        docker ps
+
+                                        
+                                        if [[ $TELEGRAF_IMAGE_KIND == 'TELEGRAF IMAGE' ]]; then
+                                        docker push skajagar/telegraf:${DOCKER_TAG_NAME}
+                                        elif [[ $TELEGRAF_IMAGE_KIND == 'TELEGRAF SIDECAR IMAGE' ]]; then
+                                        docker push skajagar/telegrafsidecar:${DOCKER_TAG_NAME}
+                                        elif [[ $TELEGRAF_IMAGE_KIND == 'ALL' ]]; then
+                                        docker push skajagar/telegraf:${DOCKER_TAG_NAME}
+                                        docker push skajagar/telegrafsidecar:${DOCKER_TAG_NAME}
+                                        else
+                                        printf '%s\n' "DOCKER IMAGE KIND IS INVALID" >&2
+                                        exit 1
+                                        fi
+                                        
+                                        '''
+
+                                        writeFile(text:PUSH_TO_DOCKER, file:"PUSH_TO_DOCKER_MANNUAL.sh")
+                                        sh "bash PUSH_TO_DOCKER_MANNUAL.sh ${DOCKER_USER} ${DOCKER_PASS} ${DOCKER_IMAGE_VERSION} \"${TELEGRAF_IMAGE_KIND}\""
+
+                                        
+                                        
+                                    }
+                                }
+                }
+   
+            }
+        }
+
+                stage("Purge Repo") {
+                            steps {
+                                script {
+                                    sh """
+                                    rm -rf ${WORKSPACE}/wavefront-kubernetes/
+                                    """
+                                    }
+                            }
+                }
+
+                stage("Purge Image") {
+                    steps {
+                        script {
+                            sh """
+                            docker login -u '${DOCKER_USER}' -p '${DOCKER_PASS}'
+                            docker system prune -af --volumes
+                            """
+                        }
+                    }
+                }    
+    }
+
+}

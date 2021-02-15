@@ -1,0 +1,446 @@
+def credentials = [[$class: 'UsernamePasswordMultiBinding', credentialsId: 'skajagar-docker', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS'], [$class: 'StringBinding', credentialsId: 'sk-jenkin-ssh-pub-text', variable: 'GH_ACCESS_TOKEN']]
+
+// def FARGATE_REPO='git@github.com:wavefrontHQ/wavefront-fargate-collector.git' 
+def TELEGRAF_REPO = 'https://github.com/influxdata/telegraf/releases' // I AM PUSHING GIT RELEASE TAGS TO MY FORKED REPO NOW
+def JOB_USER = ''
+def JOB_USER_ID = ''
+def RC_NUMBER = ''
+def DOCKER_IMAGE_VERSION = ''
+def PREFIX = ''
+def GITHUB_REPO = ''
+def FULL_GIT_REPO_NAME = ''
+def REL_BRANCH = ''
+
+pipeline {
+
+  agent any
+  options {
+    timestamps()
+    timeout(time: 10, unit: "MINUTES")
+    withCredentials(credentials)
+  }
+  parameters {
+    string(
+    defaultValue: '', name: 'TELEGRAF_VERSION', description: 'Telegraf version to release (PACKAGECLOUD).')
+    string(
+    defaultValue: '', name: 'TELEGRAF_PATCH_VERSION', description: 'Specify the patch version to upload.')
+    string(
+    defaultValue: '', name: 'PACKAGE_CLOUD_REPO', description: 'Provide repo name to upload the binaries')
+    password(
+    defaultValue: '', name: 'PACKAGE_CLOUD_TOKEN', description: 'Provide valid packagecloud token to upload')
+    choice(
+    name: "SELECT_OS", choices: ["", "ALL", "Oracle Linux", "OpenSUSE", "Enterprise Linux", "Debian", "Ubuntu", "Fedora", "SUSE Linux Enterprise Server"], description: "Select particular  OS to build - \n Oracle Linux(6,7) \n SUSE Linux Enterprise Server(12.0-12.3, 15.0-15.1) \nfedora(27-31) \nopensuse(42.3), \nEnterprise Linux(6-8), \ndebian(buster, stretch, wheezy, jessie), \nubuntu(xenial, trusty, zesty, artful, bionic)")
+  }
+
+  stages {
+
+    stage("Initialization") {
+      steps {
+        cleanWs()
+        echo "THIS IS TELGRAF VERSION : ${params.TELEGRAF_VERSION}"
+        echo "THIS IS TELEGRAF PATCH VERSION: ${params.TELEGRAF_PATCH_VERSION}"
+        echo "THIS IS PACKAGECLOUD REPO: ${params.PACKAGE_CLOUD_REPO}"
+        echo "THIS IS SELECTED OD : ${params.SELECT_OS}"
+        /*
+				                    script {
+				                         wrap([$class: 'BuildUser']) {
+				                         JOB_USER = sh( script: 'echo "${BUILD_USER}"', returnStdout: true).trim()
+				                         JOB_USER_ID = sh( script: 'echo "${BUILD_USER_ID}"', returnStdout: true).trim()
+				                      }
+				                 }
+				                 */
+      }
+    }
+
+    stage("Download the telegraf release build to upload (GITHUB)") {
+      options {
+        timeout(time: 5, unit: "MINUTES")
+      }
+
+      steps {
+
+        script {
+
+          DOWNLOAD_TELEGRAF_RELEASES = '''#!/bin/bash -xe
+				                    TELEGRAF_VERSION=$1
+				                    TELEGRAF_PATCH=$2
+				                    WORKSPACE=$3
+
+				                    
+				                    curl -LJO https://dl.influxdata.com/telegraf/releases/telegraf-${TELEGRAF_VERSION}-${TELEGRAF_PATCH}.x86_64.rpm
+				                    curl -LJO https://dl.influxdata.com/telegraf/releases/telegraf_${TELEGRAF_VERSION}-${TELEGRAF_PATCH}_amd64.deb
+
+				                    '''
+
+          writeFile(text: DOWNLOAD_TELEGRAF_RELEASES, file: "DOWNLOAD_TELEGRAF_RELEASES.sh")
+          sh "bash DOWNLOAD_TELEGRAF_RELEASES.sh ${TELEGRAF_VERSION} ${TELEGRAF_PATCH_VERSION} ${WORKSPACE}"
+        }
+
+      }
+
+    }
+
+    stage("Create config file for packagecloud") {
+      when {
+        expression {
+          params.PACKAGE_CLOUD_TOKEN != ""
+        }
+      }
+
+      options {
+        timeout(time: 5, unit: "MINUTES")
+      }
+
+      steps {
+        script {
+
+          CREATE_PACKAGE_CLOUD_CONFIG = '''#!/bin/bash -xe
+				                    PACKAGE_CLOUD_TOKEN1=$1
+				                    WORKSPACE=$2
+
+				                    cd ${WORKSPACE}
+				                    touch .packagecloud
+				                    echo { '"token"': '"'${PACKAGE_CLOUD_TOKEN1}'"' } >> ${WORKSPACE}/.packagecloud
+
+				                    '''
+
+          writeFile(text: CREATE_PACKAGE_CLOUD_CONFIG, file: "CREATE_PACKAGE_CLOUD_CONFIG.sh")
+          sh "bash CREATE_PACKAGE_CLOUD_CONFIG.sh ${params.PACKAGE_CLOUD_TOKEN} ${WORKSPACE}"
+
+        }
+      }
+    }
+
+    stage("Check OS Select to upload to packagecloud") {
+      options {
+        timeout(time: 10, unit: "MINUTES")
+      }
+
+      parallel {
+
+        stage("SELECTED OS: Oracle Linux") {
+          when {
+            expression {
+              params.SELECT_OS == "Oracle Linux"
+
+            }
+          }
+          steps {
+            script {
+
+            PUSH_TO_PACKAGECLOUD = '''#!/bin/bash -xe
+                                    PACKAGE_CLOUD_REPO=$1
+                                    WORKSPACE=$2
+                                    cd ${WORKSPACE}
+                                    package_cloud push ${PACKAGE_CLOUD_REPO}/ol/6 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+                                    package_cloud push ${PACKAGE_CLOUD_REPO}/ol/7 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+
+                                    '''
+
+              writeFile(text: PUSH_TO_PACKAGECLOUD, file: "PUSH_TO_PACKAGECLOUD_OL.sh")
+              sh "bash PUSH_TO_PACKAGECLOUD_OL.sh ${PACKAGE_CLOUD_REPO} ${WORKSPACE}"
+
+            }
+          }
+
+        }
+
+        stage("SELECTED OS: SUSE Linux Enterprise Server") {
+          when {
+            expression {
+              params.SELECT_OS == "SUSE Linux Enterprise Server"
+            }
+          }
+          steps {
+            script {
+
+            PUSH_TO_PACKAGECLOUD = '''#!/bin/bash -xe
+                                    PACKAGE_CLOUD_REPO=$1
+                                    WORKSPACE=$2
+                                    cd ${WORKSPACE}
+                                    
+                                    echo "uploading binaries for SUSE Linux Enterprise Server 12.0"
+                                    package_cloud push ${PACKAGE_CLOUD_REPO}/sles/12.0 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+                                    echo "uploading binaries for SUSE Linux Enterprise Server 12.1"
+                                    package_cloud push ${PACKAGE_CLOUD_REPO}/sles/12.1 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+                                    echo "uploading binaries for SUSE Linux Enterprise Server 12.2"
+                                    package_cloud push ${PACKAGE_CLOUD_REPO}/sles/12.2 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+                                    echo "uploading binaries for SUSE Linux Enterprise Server 12.3"
+                                    package_cloud push ${PACKAGE_CLOUD_REPO}/sles/12.3 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+                                    echo "uploading binaries for SUSE Linux Enterprise Server 15.0"
+                                    package_cloud push ${PACKAGE_CLOUD_REPO}/sles/15.0 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+                                    echo "uploading binaries for SUSE Linux Enterprise Server 15.1"
+                                    package_cloud push ${PACKAGE_CLOUD_REPO}/sles/15.1 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+
+                                    '''
+
+              writeFile(text: PUSH_TO_PACKAGECLOUD, file: "PUSH_TO_PACKAGECLOUD_SLES.sh")
+              sh "bash PUSH_TO_PACKAGECLOUD_SLES.sh ${PACKAGE_CLOUD_REPO} ${WORKSPACE}"
+
+            }
+          }
+        }
+
+        stage("SELECTED OS: Fedora") {
+          when {
+            expression {
+              params.SELECT_OS == "Fedora"
+            }
+          }
+          steps {
+            script {
+
+            PUSH_TO_PACKAGECLOUD = '''#!/bin/bash -xe
+                                   PACKAGE_CLOUD_REPO=$1
+                                   WORKSPACE=$2
+                                   cd ${WORKSPACE}
+
+                                   echo "uploading binaries for Fedora 27"
+						           package_cloud push ${PACKAGE_CLOUD_REPO}/fedora/27 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						           echo "uploading binaries for Oracle Linux 28"
+						           package_cloud push ${PACKAGE_CLOUD_REPO}/fedora/28 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						           echo "uploading binaries for Fedora 29"
+						           package_cloud push ${PACKAGE_CLOUD_REPO}/fedora/29 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						           echo "uploading binaries for Oracle Linux 30"
+						           package_cloud push ${PACKAGE_CLOUD_REPO}/fedora/30 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						           echo "uploading binaries for Fedora 31"
+						           package_cloud push ${PACKAGE_CLOUD_REPO}/fedora/31 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+                                   
+
+                                   '''
+
+              writeFile(text: PUSH_TO_PACKAGECLOUD, file: "PUSH_TO_PACKAGECLOUD_FEDORA.sh")
+              sh "bash PUSH_TO_PACKAGECLOUD_FEDORA.sh ${PACKAGE_CLOUD_REPO} ${WORKSPACE}"
+
+            }
+          }
+        }
+
+        stage("SELECTED OS: OpenSUSE") {
+          when {
+            expression {
+              params.SELECT_OS == "OpenSUSE"
+            }
+          }
+          steps {
+            script {
+
+            PUSH_TO_PACKAGECLOUD = '''#!/bin/bash -xe
+                                    PACKAGE_CLOUD_REPO=$1
+                                    WORKSPACE=$2
+                                    cd ${WORKSPACE}
+
+                                    echo "uploading binaries for openSUSE 42.3"
+										package_cloud push ${PACKAGE_CLOUD_REPO}/opensuse/42.3 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+                                    
+
+                                    '''
+
+              writeFile(text: PUSH_TO_PACKAGECLOUD, file: "PUSH_TO_PACKAGECLOUD_OPENSUSE.sh")
+              sh "bash PUSH_TO_PACKAGECLOUD_OPENSUSE.sh ${PACKAGE_CLOUD_REPO} ${WORKSPACE}"
+
+            }
+          }
+        }
+
+        stage("SELECTED OS: Enterprise Linux") {
+          when {
+            expression {
+              params.SELECT_OS == "Enterprise Linux"
+            }
+          }
+          steps {
+            script {
+
+            PUSH_TO_PACKAGECLOUD = '''#!/bin/bash -xe
+                                    PACKAGE_CLOUD_REPO=$1
+                                    WORKSPACE=$2
+                                    cd ${WORKSPACE}
+
+                                    echo "uploading binaries for Enterprise Linux 6"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/el/6 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for Enterprise Linux 7"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/el/7 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for Enterprise Linux 8"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/el/8 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+                                    
+                                    
+
+                                    '''
+
+              writeFile(text: PUSH_TO_PACKAGECLOUD, file: "PUSH_TO_PACKAGECLOUD_EL.sh")
+              sh "bash PUSH_TO_PACKAGECLOUD_EL.sh ${PACKAGE_CLOUD_REPO} ${WORKSPACE}"
+
+            }
+          }
+        }
+
+        stage("SELECTED OS: Debian") {
+          when {
+            expression {
+              params.SELECT_OS == "Debian"
+            }
+          }
+          steps {
+            script {
+
+            PUSH_TO_PACKAGECLOUD = '''#!/bin/bash -xe
+                                    PACKAGE_CLOUD_REPO=$1
+                                    WORKSPACE=$2
+                                    cd ${WORKSPACE}
+
+                                    echo "uploading binaries for debian buster"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/debian/buster telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for debian stretch"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/debian/stretch telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for debian wheezy"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/debian/wheezy telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for debian jessie"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/debian/jessie telegraf*deb --config ${WORKSPACE}/.packagecloud
+
+                                    
+                                    '''
+
+              writeFile(text: PUSH_TO_PACKAGECLOUD, file: "PUSH_TO_PACKAGECLOUD_DEBIAN.sh")
+              sh "bash PUSH_TO_PACKAGECLOUD_DEBIAN.sh ${PACKAGE_CLOUD_REPO} ${WORKSPACE}"
+
+            }
+          }
+        }
+
+        stage("SELECTED OS: Ubuntu") {
+          when {
+            expression {
+              params.SELECT_OS == "Ubuntu"
+            }
+          }
+          steps {
+            script {
+
+            PUSH_TO_PACKAGECLOUD = '''#!/bin/bash -xe
+                                    PACKAGE_CLOUD_REPO=$1
+                                    WORKSPACE=$2
+                                    cd ${WORKSPACE}
+
+                                    echo "uploading binaries for ubuntu/xenial"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/ubuntu/xenial telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for ubuntu/trusty"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/ubuntu/trusty telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for ubuntu/zesty"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/ubuntu/zesty telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for ubuntu/artful"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/ubuntu/artful telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for ubuntu/bionic"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/ubuntu/bionic telegraf*deb --config ${WORKSPACE}/.packagecloud
+
+                                    
+                                    '''
+
+              writeFile(text: PUSH_TO_PACKAGECLOUD, file: "PUSH_TO_PACKAGECLOUD_UBUNTU.sh")
+              sh "bash PUSH_TO_PACKAGECLOUD_UBUNTU.sh ${PACKAGE_CLOUD_REPO} ${WORKSPACE}"
+
+            }
+          }
+        }
+
+        stage("SELECTED OS: ALL") {
+          when {
+            expression {
+              params.SELECT_OS == "ALL"
+            }
+          }
+          steps {
+            script {
+
+            PUSH_TO_PACKAGECLOUD = '''#!/bin/bash -xe
+                                    PACKAGE_CLOUD_REPO=$1
+                                    WORKSPACE=$2
+                                    cd ${WORKSPACE}
+
+
+                                    echo "************************ Oracle Linux **************************"
+						            echo "uploading binaries for Oracle Linux 6"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/ol/6 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for Oracle Linux 7"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/ol/7 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "************************ SUSE Linux Enterprise Server **************************"
+						            echo "uploading binaries for SUSE Linux Enterprise Server 12.0"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/sles/12.0 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for SUSE Linux Enterprise Server 12.1"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/sles/12.1 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for SUSE Linux Enterprise Server 12.2"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/sles/12.2 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for SUSE Linux Enterprise Server 12.3"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/sles/12.3 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for SUSE Linux Enterprise Server 15.0"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/sles/15.0 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for SUSE Linux Enterprise Server 15.1"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/sles/15.1 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "************************ Fedora **************************"
+						            echo "uploading binaries for Fedora 27"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/fedora/27 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for Oracle Linux 28"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/fedora/28 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for Fedora 29"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/fedora/29 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for Oracle Linux 30"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/fedora/30 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for Fedora 31"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/fedora/31 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "************************ OpenSUSE **************************"
+						            echo "uploading binaries for openSUSE 42.3"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/opensuse/42.3 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "************************ Enterprise Linux **************************"
+						            echo "uploading binaries for Enterprise Linux 6"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/el/6 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for Enterprise Linux 7"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/el/7 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for Enterprise Linux 8"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/el/8 telegraf*rpm --config ${WORKSPACE}/.packagecloud
+						            echo "************************ Debian **************************"
+						            echo "uploading binaries for debian buster"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/debian/buster telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for debian stretch"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/debian/stretch telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for debian wheezy"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/debian/wheezy telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for debian jessie"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/debian/jessie telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "************************ ubuntu **************************"
+						            echo "uploading binaries for ubuntu/xenial"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/ubuntu/xenial telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for ubuntu/trusty"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/ubuntu/trusty telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for ubuntu/zesty"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/ubuntu/zesty telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for ubuntu/artful"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/ubuntu/artful telegraf*deb --config ${WORKSPACE}/.packagecloud
+						            echo "uploading binaries for ubuntu/bionic"
+						            package_cloud push ${PACKAGE_CLOUD_REPO}/ubuntu/bionic telegraf*deb --config ${WORKSPACE}/.packagecloud
+
+                                    
+                                    '''
+
+              writeFile(text: PUSH_TO_PACKAGECLOUD, file: "PUSH_TO_PACKAGECLOUD_ALL.sh")
+              sh "bash PUSH_TO_PACKAGECLOUD_ALL.sh ${PACKAGE_CLOUD_REPO} ${WORKSPACE}"
+
+            }
+          }
+        }
+
+      }
+    }
+
+    stage("Purge Repo") {
+      steps {
+        script {
+          		sh """
+                rm -rf ${WORKSPACE}/wavefront-kubernetes/
+                """
+        }
+      }
+    }
+
+  }
+
+}
